@@ -4,6 +4,14 @@ What changed in each release, newest first. The full notes for each are on the
 [releases page](https://github.com/d-safro/conductor/releases); what stays the same from 1.0 on is in
 [docs/STABILITY.md](docs/STABILITY.md).
 
+## 1.7.2 (2026-11-28)
+
+### Fixed
+- **Liked songs in Spotify's order:** Spotify sync hearted each liked song with the time of the sync (or of its
+  arrival), so the hearted list, newest heart first, was in the order songs reached the server. Each song's heart
+  now has the time it was liked on Spotify, set again every sync, which also corrects earlier syncs and songs that
+  arrived since. A heart made only here keeps its own time.
+
 ## 1.7.1 (2026-11-24)
 
 ### Fixed

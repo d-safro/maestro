@@ -265,3 +265,82 @@ async fn discovery_and_spotify_playlists_tell_their_owner() {
     assert_eq!(lists, want);
     assert!(s.heard(&s.other).is_empty(), "nobody else hears");
 }
+
+/// Spotify for the liked-order test: three liked songs, newest first, each with when it was liked.
+async fn liked_stand_in() -> String {
+    use axum::{extract::Request, response::IntoResponse};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let app = axum::Router::new().fallback(move |req: Request| async move {
+        let t = |id: &str, name: &str| json!({ "id": id, "name": name, "type": "track", "artists": [{ "name": "Alpha" }], "duration_ms": 2000 });
+        let body = match req.uri().path() {
+            "/sp/api/token" => json!({ "access_token": "acc", "expires_in": 3600 }),
+            "/sp/v1/me/tracks" => json!({ "items": [
+                { "added_at": "2026-11-20T10:00:00Z", "track": t("sp-3", "Three") },
+                { "added_at": "2025-01-01T00:00:00Z", "track": t("sp-1", "One") },
+                { "added_at": "2024-06-01T12:00:00Z", "track": t("sp-2", "Two") },
+            ], "next": null }),
+            "/sp/v1/me/playlists" => json!({ "items": [], "next": null }),
+            _ => return (axum::http::StatusCode::NOT_FOUND, "{}").into_response(),
+        };
+        axum::Json(body).into_response()
+    });
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    base
+}
+
+#[tokio::test]
+async fn spotify_liked_songs_are_hearted_in_spotifys_order() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not found");
+        return;
+    }
+    let base = liked_stand_in().await;
+    let s = state(&["One", "Two", "Three", "Four"], |c| {
+        c.listenbrainz_user = Some("lbuser".into());
+        c.spotify_api_url = format!("{base}/sp/v1");
+        c.spotify_accounts_url = format!("{base}/sp");
+    })
+    .await;
+    let heart = async |title: &str, at: i64| {
+        sqlx::query("INSERT INTO annotation (user_id, item_kind, item_id, starred_at) VALUES (?, 'track', ?, ?)")
+            .bind(&s.owner)
+            .bind(s.track(title).await)
+            .bind(at)
+            .execute(&s.st.db)
+            .await
+            .unwrap();
+    };
+    // Two was hearted by an earlier sync (when it arrived, not when it was liked); Four only here, on the phone
+    let now = db::now();
+    heart("Two", now - 60).await;
+    heart("Four", now).await;
+    for (k, v) in [("spotify_token", r#"{"client_id": "cid", "refresh_token": "r"}"#), ("spotify_settings", r#"{"liked": true, "playlists": []}"#)] {
+        sqlx::query("INSERT INTO setting (key, value) VALUES (?, ?)").bind(k).bind(v).execute(&s.st.db).await.unwrap();
+    }
+    conductor::spotify::sync_once(&s.st).await.unwrap();
+
+    let at = async |title: &str| -> Option<i64> {
+        sqlx::query_scalar("SELECT starred_at FROM annotation WHERE user_id = ? AND item_kind = 'track' AND item_id = ?")
+            .bind(&s.owner)
+            .bind(s.track(title).await)
+            .fetch_one(&s.st.db)
+            .await
+            .unwrap()
+    };
+    // each Spotify-liked song carries the time it was liked there; the one hearted only here keeps its own
+    assert_eq!(at("Three").await, db::parse_iso("2026-11-20T10:00:00Z"));
+    assert_eq!(at("One").await, db::parse_iso("2025-01-01T00:00:00Z"));
+    assert_eq!(at("Two").await, db::parse_iso("2024-06-01T12:00:00Z"), "an earlier sync's time is corrected");
+    assert_eq!(at("Four").await, Some(now));
+    // so the hearted list (newest heart first, as getStarred2 lists it) is Spotify's order
+    let titles: Vec<String> = sqlx::query_scalar(
+        "SELECT t.title FROM annotation an JOIN track t ON t.id = an.item_id
+         WHERE an.user_id = ? AND an.item_kind = 'track' AND an.starred_at IS NOT NULL ORDER BY an.starred_at DESC",
+    )
+    .bind(&s.owner)
+    .fetch_all(&s.st.db)
+    .await
+    .unwrap();
+    assert_eq!(titles, ["Four", "Three", "One", "Two"]);
+}

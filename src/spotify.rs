@@ -148,6 +148,9 @@ struct Song {
     artists: Vec<String>,
     isrc: Option<String>,
     ms: i64,
+    /// When it was liked on Spotify (Liked Songs only): its heart here gets the same time, so the hearted list
+    /// (newest heart first) is in Spotify's order
+    liked_at: Option<i64>,
 }
 
 fn song(t: &Value) -> Option<Song> {
@@ -160,6 +163,7 @@ fn song(t: &Value) -> Option<Song> {
         artists: t["artists"].as_array().into_iter().flatten().filter_map(|a| a["name"].as_str().map(String::from)).collect(),
         isrc: t["external_ids"]["isrc"].as_str().map(String::from),
         ms: t["duration_ms"].as_i64().unwrap_or(0),
+        liked_at: None,
     })
 }
 
@@ -264,8 +268,13 @@ pub async fn sync_once(st: &AppState) -> Result<(usize, usize, usize)> {
         choices["playlists"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
     let mut lists: Vec<(String, Vec<Song>)> = vec![];
     if choices["liked"].as_bool().unwrap_or(true) {
-        // newest liked at the top
-        let liked: Vec<Song> = c.pages("/me/tracks?limit=50").await?.iter().filter_map(|i| song(&i["track"])).collect();
+        // newest liked at the top, each with when it was liked
+        let liked: Vec<Song> = c
+            .pages("/me/tracks?limit=50")
+            .await?
+            .iter()
+            .filter_map(|i| song(&i["track"]).map(|s| Song { liked_at: i["added_at"].as_str().and_then(db::parse_iso), ..s }))
+            .collect();
         lists.push((LIKED.into(), liked));
     }
     for p in c.pages("/me/playlists?limit=50").await? {
@@ -293,11 +302,13 @@ pub async fn sync_once(st: &AppState) -> Result<(usize, usize, usize)> {
     for (name, songs) in &lists {
         let pid = playlist(st, &owner, name).await?;
         let mut ids: Vec<String> = vec![];
+        let mut liked_at: Vec<Option<i64>> = vec![]; // beside ids: when Spotify says each was liked
         for s in songs {
             match find_local(st, s).await {
                 Some(t) => {
                     if !ids.contains(&t) {
                         ids.push(t);
+                        liked_at.push(s.liked_at);
                     }
                 }
                 None => {
@@ -325,13 +336,16 @@ pub async fn sync_once(st: &AppState) -> Result<(usize, usize, usize)> {
         }
         sqlx::query("UPDATE playlist SET updated_at = ? WHERE id = ?").bind(now()).bind(&pid).execute(&mut *tx).await?;
         if name == LIKED {
-            for id in &ids {
+            for (id, at) in ids.iter().zip(&liked_at) {
                 sqlx::query("INSERT OR IGNORE INTO annotation (user_id, item_kind, item_id) VALUES (?, 'track', ?)")
                     .bind(&owner)
                     .bind(id)
                     .execute(&mut *tx)
                     .await?;
-                sqlx::query("UPDATE annotation SET starred_at = COALESCE(starred_at, ?) WHERE user_id = ? AND item_kind = 'track' AND item_id = ?")
+                // Spotify's time when it says one (every sync: a song that arrived since, hearted then, moves to
+                // its place), else the heart it has, else now
+                sqlx::query("UPDATE annotation SET starred_at = COALESCE(?, starred_at, ?) WHERE user_id = ? AND item_kind = 'track' AND item_id = ?")
+                    .bind(*at)
                     .bind(now())
                     .bind(&owner)
                     .bind(id)
